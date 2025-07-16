@@ -4,11 +4,14 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import os
 import openpyxl
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+from src.news_filter import is_news_blocking
 
 # --- CONFIG ---
 SYMBOL = 'XAUUSDm'
 RISK_PER_TRADE = 0.01
-LOT_SIZE = 0.01
 # Set session hours to match Exness Market Watch time (UTC+0)
 SESSION_HOURS = [1, 5, 9, 13, 15, 18, 21]  # These are in Exness Market Watch time (UTC+0)
 USE_ORDER_BLOCK = True
@@ -61,6 +64,17 @@ def get_broker_time():
         return datetime.now(timezone.utc)
     return datetime.fromtimestamp(tick.time, timezone.utc)
 
+# --- Helper: Get minimum stop level in price units ---
+def get_min_stop_level():
+    info = mt5.symbol_info(SYMBOL)
+    if info is None or info.stops_level is None:
+        return 1.0  # fallback default
+    # stops_level is in points, convert to price units
+    point = info.point if info.point else 0.01
+    min_stop = info.stops_level * point
+    # If broker reports 0, use fallback
+    return min_stop if min_stop > 0 else 1.0
+
 # --- Trade Limiting and R:R Filter ---
 trades_today = 0
 last_trade_day = None
@@ -85,6 +99,29 @@ def log_trade(ticket, dt, symbol, direction, entry, sl, tp, lot, rr1, rr2, statu
     ])
     wb.save(JOURNAL_FILE)
 
+# --- Helper: Move SL to breakeven ---
+def move_sl_to_breakeven(ticket, breakeven_price):
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "sl": breakeven_price,
+        "tp": 0.0,
+        "symbol": SYMBOL,
+    }
+    mt5.order_send(request)
+
+# --- Helper: Calculate position size for 1% risk ---
+def calculate_lot_size(entry, sl, balance, risk_pct):
+    risk_amount = balance * risk_pct
+    pip_risk = abs(entry - sl)
+    if pip_risk == 0:
+        return 0.01  # fallback minimum
+    # For gold, 1 lot = 100 oz, $1 move = $100 per lot
+    lot_size = risk_amount / (pip_risk * 100)
+    # Round down to nearest 0.01
+    lot_size = max(0.01, round(lot_size, 2))
+    return lot_size
+
 # --- Main CRT Strategy Loop ---
 print("Starting advanced CRT strategy on live Exness demo...")
 last_trade_time = None
@@ -92,6 +129,7 @@ last_trade_time = None
 while True:
     broker_now = get_broker_time()
     broker_day = broker_now.date()
+    min_stop = get_min_stop_level()
     if last_trade_day != broker_day:
         trades_today = 0
         last_trade_day = broker_day
@@ -102,6 +140,11 @@ while True:
     if broker_now.hour not in SESSION_HOURS:
         print(f"{broker_now} Not in CRT session hours (Market Watch time). Waiting...")
         time.sleep(60)
+        continue
+    # News filter: skip trading if high-impact news is near
+    if is_news_blocking():
+        print("Skipping trading due to high-impact news event.")
+        time.sleep(1800)  # Wait 30 minutes before next check
         continue
     # Get last 3 H1 candles for power of three
     h1_df = get_rates(SYMBOL, RANGE_TIMEFRAME, 3, 1)
@@ -168,7 +211,8 @@ while True:
     last_trade_time = entry_candle.name
     # Calculate SL/TP and R:R
     if direction == 'SELL':
-        sl = entry_candle['high'] + (entry_candle['high'] - entry_candle['close']) * 0.1  # Just above the wick
+        raw_sl = entry_candle['high'] + (entry_candle['high'] - entry_candle['close']) * 0.1
+        sl = min(raw_sl, price - min_stop) if raw_sl < price - min_stop else raw_sl + min_stop
         tp1 = (crt_high + crt_low) / 2
         tp2 = crt_low
         price = mt5.symbol_info_tick(SYMBOL).bid
@@ -176,43 +220,85 @@ while True:
         rr1 = abs(price - tp1) / risk if risk > 0 else 0
         rr2 = abs(price - tp2) / risk if risk > 0 else 0
     else:
-        sl = entry_candle['low'] - (entry_candle['close'] - entry_candle['low']) * 0.1  # Just below the wick
+        raw_sl = entry_candle['low'] - (entry_candle['close'] - entry_candle['low']) * 0.1
+        sl = max(raw_sl, price + min_stop) if raw_sl > price + min_stop else raw_sl - min_stop
         tp1 = (crt_high + crt_low) / 2
         tp2 = crt_high
         price = mt5.symbol_info_tick(SYMBOL).ask
         risk = abs(price - sl)
         rr1 = abs(price - tp1) / risk if risk > 0 else 0
         rr2 = abs(price - tp2) / risk if risk > 0 else 0
+    # --- Dynamic lot size for 1% risk per trade ---
+    account = mt5.account_info()
+    balance = account.balance if account else 10000
+    contract_size = mt5.symbol_info(SYMBOL).trade_contract_size if mt5.symbol_info(SYMBOL) else 100
+    max_risk = balance * RISK_PER_TRADE
+    # For gold, pip value is usually $1 per lot per $1 move, but use contract_size for safety
+    lot_size = max_risk / (risk * contract_size) if risk > 0 else 0.01
+    lot_size = max(lot_size, 0.01)  # enforce broker minimum
+    half_lot = round(lot_size / 2, 2)
     # Only trade if R:R to at least one TP is 2.0+
     if max(rr1, rr2) < 2.0:
         print(f"{broker_now} R:R too low (TP1: {rr1:.2f}, TP2: {rr2:.2f}). Skipping trade.")
         time.sleep(60)
         continue
-    # Place order
-    request = {
+    # Place order (split into two positions for partial TP)
+    # First position: TP1 (mid-range)
+    request1 = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": SYMBOL,
-        "volume": LOT_SIZE,
+        "volume": half_lot,
         "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
         "price": price,
         "sl": sl,
-        "tp": tp2 if TP_MODE == 'full' else tp1,
+        "tp": tp1,
         "deviation": 20,
         "magic": 123456,
-        "comment": "CRT advanced",
+        "comment": "CRT advanced TP1",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-    result = mt5.order_send(request)
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"{entry_candle.name} {direction} order placed at {price} | SL: {sl} | TP: {request['tp']} | RR1: {rr1:.2f} | RR2: {rr2:.2f}")
-        trades_today += 1
-        # Log entry to Excel
-        log_trade(
-            result.order, str(broker_now), SYMBOL, direction, price, sl, request['tp'], LOT_SIZE, rr1, rr2, "OPEN", "", "", request['comment']
-        )
+    # Second position: TP2 (full range)
+    request2 = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": half_lot,
+        "type": mt5.ORDER_TYPE_SELL if direction == 'SELL' else mt5.ORDER_TYPE_BUY,
+        "price": price,
+        "sl": sl,
+        "tp": tp2,
+        "deviation": 20,
+        "magic": 123457,
+        "comment": "CRT advanced TP2",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result1 = mt5.order_send(request1)
+    result2 = mt5.order_send(request2)
+    if result1.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"{entry_candle.name} {direction} TP1 order placed at {price} | SL: {sl} | TP: {tp1} | RR1: {rr1:.2f}")
+        log_trade(result1.order, str(broker_now), SYMBOL, direction, price, sl, tp1, half_lot, rr1, rr2, "OPEN", "", "", request1['comment'])
     else:
-        print(f"Order failed: {result.retcode} {result.comment}")
-    time.sleep(60)
+        print(f"Order 1 failed: {result1.retcode} {result1.comment}")
+    if result2.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"{entry_candle.name} {direction} TP2 order placed at {price} | SL: {sl} | TP: {tp2} | RR2: {rr2:.2f}")
+        log_trade(result2.order, str(broker_now), SYMBOL, direction, price, sl, tp2, half_lot, rr1, rr2, "OPEN", "", "", request2['comment'])
+    else:
+        print(f"Order 2 failed: {result2.retcode} {result2.comment}")
+    trades_today += 1
+    # Monitor for TP1 hit to move SL to breakeven for TP2
+    if result1.retcode == mt5.TRADE_RETCODE_DONE and result2.retcode == mt5.TRADE_RETCODE_DONE:
+        tp1_hit = False
+        while not tp1_hit:
+            time.sleep(10)
+            pos = mt5.positions_get(ticket=result1.order)
+            if not pos:
+                # TP1 closed
+                tp1_hit = True
+                # Move SL to breakeven for TP2
+                move_sl_to_breakeven(result2.order, price)
+                print(f"Moved SL to breakeven for TP2 position {result2.order}")
+    else:
+        time.sleep(60)
 
 mt5.shutdown()
